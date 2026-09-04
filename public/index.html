@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BPM Sorter</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Spotify BPM Sorter</h1>
+      <p class="subtitle">Paste a public playlist link. Get tracks sorted by tempo.</p>
+    </header>
+
+    <form id="sortForm">
+      <input
+        id="playlistInput"
+        type="text"
+        placeholder="https://open.spotify.com/playlist/..."
+        autocomplete="off"
+        required
+      />
+      <select id="orderSelect">
+        <option value="asc">Slowest → Fastest</option>
+        <option value="desc">Fastest → Slowest</option>
+      </select>
+      <button type="submit" id="submitBtn">Sort</button>
+    </form>
+
+    <p id="status" class="status" hidden></p>
+
+    <section id="results" hidden>
+      <div class="results-head">
+        <h2 id="playlistTitle"></h2>
+        <button id="exportBtn" type="button">Export CSV</button>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>BPM</th>
+            <th>Title</th>
+            <th>Artist</th>
+            <th>Album</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="resultsBody"></tbody>
+      </table>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
