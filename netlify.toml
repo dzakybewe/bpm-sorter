@@ -1,0 +1,23 @@
+[build]
+  publish = "public"
+  functions = "netlify/functions"
+
+# Static files (index.html, app.js, style.css) are served directly from `public` by
+# Netlify's CDN — only the dynamic routes below need to reach the Express function.
+# The `:splat`/exact targets keep the same path Express expects internally (e.g. still
+# `/api/sort`, not `/sort`), so server.js's route definitions don't need to change.
+
+[[redirects]]
+  from = "/api/*"
+  to = "/.netlify/functions/server/api/:splat"
+  status = 200
+
+[[redirects]]
+  from = "/login"
+  to = "/.netlify/functions/server/login"
+  status = 200
+
+[[redirects]]
+  from = "/callback"
+  to = "/.netlify/functions/server/callback"
+  status = 200

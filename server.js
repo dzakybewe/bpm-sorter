@@ -5,16 +5,56 @@ const fetch = require('node-fetch');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const REDIRECT_URI = `http://127.0.0.1:${PORT}/callback`;
+// Netlify (and most hosts) run this behind HTTPS on a domain we don't control locally —
+// SPOTIFY_REDIRECT_URI overrides the 127.0.0.1 default used for local dev. Must match
+// exactly what's registered in the Spotify dashboard.
+const REDIRECT_URI = process.env.SPOTIFY_REDIRECT_URI || `http://127.0.0.1:${PORT}/callback`;
+const IS_HTTPS = REDIRECT_URI.startsWith('https://');
 
-const { SPOTIFY_CLIENT_ID, GETSONGBPM_API_KEY } = process.env;
+const { SPOTIFY_CLIENT_ID, GETSONGBPM_API_KEY, SESSION_SECRET } = process.env;
 
 app.use(express.static('public'));
 app.use(express.json());
 
-// ---------- tiny cookie-session helpers (single-user local tool) ----------
-const sessions = new Map(); // sid -> { accessToken, refreshToken, expiresAt }
-const pendingLogins = new Map(); // state -> { verifier, ts }
+// ---------- signed-cookie session helpers ----------
+// No server-side session store: serverless hosts (Netlify, Vercel, ...) don't guarantee
+// the same process handles /login and /callback, so state that only lived in an in-memory
+// Map would vanish between requests. Everything needed to resume login or stay logged in
+// travels in the cookie itself, HMAC-signed so it can't be forged or tampered with from
+// the browser. Values are still opaque to JS (HttpOnly) and only sent over HTTPS in
+// production (Secure, gated on IS_HTTPS so local http://127.0.0.1 dev still works).
+
+function base64url(buf) {
+  return buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function getSessionSecret() {
+  if (!SESSION_SECRET) {
+    throw new Error('Missing SESSION_SECRET in .env — required to sign session cookies.');
+  }
+  return SESSION_SECRET;
+}
+
+function sign(payload) {
+  const body = base64url(Buffer.from(JSON.stringify(payload)));
+  const mac = base64url(crypto.createHmac('sha256', getSessionSecret()).update(body).digest());
+  return `${body}.${mac}`;
+}
+
+function unsign(value) {
+  if (!value) return null;
+  const [body, mac] = value.split('.');
+  if (!body || !mac) return null;
+  const expectedMac = base64url(crypto.createHmac('sha256', getSessionSecret()).update(body).digest());
+  const a = Buffer.from(mac);
+  const b = Buffer.from(expectedMac);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+  try {
+    return JSON.parse(Buffer.from(body, 'base64').toString('utf8'));
+  } catch {
+    return null;
+  }
+}
 
 function parseCookies(req) {
   const header = req.headers.cookie || '';
@@ -26,17 +66,23 @@ function parseCookies(req) {
   );
 }
 
-function getOrCreateSid(req, res) {
-  const cookies = parseCookies(req);
-  if (cookies.sid && sessions.has(cookies.sid)) return cookies.sid;
-
-  const sid = crypto.randomBytes(24).toString('hex');
-  res.setHeader('Set-Cookie', `sid=${sid}; HttpOnly; SameSite=Lax; Path=/`);
-  return sid;
+function setCookie(res, name, value, maxAgeSeconds) {
+  const parts = [
+    `${name}=${encodeURIComponent(value)}`,
+    'HttpOnly',
+    'SameSite=Lax',
+    'Path=/',
+    `Max-Age=${maxAgeSeconds}`,
+  ];
+  if (IS_HTTPS) parts.push('Secure');
+  const existing = res.getHeader('Set-Cookie');
+  const header = existing ? (Array.isArray(existing) ? existing : [existing]) : [];
+  header.push(parts.join('; '));
+  res.setHeader('Set-Cookie', header);
 }
 
-function base64url(buf) {
-  return buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+function clearCookie(res, name) {
+  setCookie(res, name, '', 0);
 }
 
 // ---------- Spotify: Authorization Code + PKCE (user login required for playlist items) ----------
@@ -55,7 +101,7 @@ async function exchangeToken(params) {
 
 async function getUserAccessToken(req, res) {
   const cookies = parseCookies(req);
-  const session = sessions.get(cookies.sid);
+  const session = unsign(cookies.session);
   if (!session) return null;
 
   if (Date.now() < session.expiresAt) return session.accessToken;
@@ -68,12 +114,15 @@ async function getUserAccessToken(req, res) {
       refresh_token: session.refreshToken,
       client_id: SPOTIFY_CLIENT_ID,
     });
-    session.accessToken = data.access_token;
-    if (data.refresh_token) session.refreshToken = data.refresh_token; // Spotify may rotate it
-    session.expiresAt = Date.now() + (data.expires_in - 60) * 1000;
-    return session.accessToken;
+    const updated = {
+      accessToken: data.access_token,
+      refreshToken: data.refresh_token || session.refreshToken, // Spotify may rotate it
+      expiresAt: Date.now() + (data.expires_in - 60) * 1000,
+    };
+    setCookie(res, 'session', sign(updated), 60 * 60 * 24 * 30);
+    return updated.accessToken;
   } catch (e) {
-    sessions.delete(cookies.sid);
+    clearCookie(res, 'session');
     return null;
   }
 }
@@ -250,7 +299,7 @@ app.get('/login', (req, res) => {
   const verifier = base64url(crypto.randomBytes(64));
   const challenge = base64url(crypto.createHash('sha256').update(verifier).digest());
   const state = crypto.randomBytes(16).toString('hex');
-  pendingLogins.set(state, { verifier, ts: Date.now() });
+  setCookie(res, 'pkce', sign({ verifier, state }), 600); // 10 min to complete login
 
   const params = new URLSearchParams({
     client_id: SPOTIFY_CLIENT_ID,
@@ -270,9 +319,11 @@ app.get('/callback', async (req, res) => {
 
   if (error) return res.status(400).send(`Spotify login failed: ${error}`);
 
-  const pending = state && pendingLogins.get(state);
-  if (!pending) return res.status(400).send('Login expired or invalid state, try again.');
-  pendingLogins.delete(state);
+  const pending = unsign(parseCookies(req).pkce);
+  clearCookie(res, 'pkce');
+  if (!pending || pending.state !== state) {
+    return res.status(400).send('Login expired or invalid state, try again.');
+  }
 
   try {
     const data = await exchangeToken({
@@ -283,12 +334,16 @@ app.get('/callback', async (req, res) => {
       code_verifier: pending.verifier,
     });
 
-    const sid = getOrCreateSid(req, res);
-    sessions.set(sid, {
-      accessToken: data.access_token,
-      refreshToken: data.refresh_token,
-      expiresAt: Date.now() + (data.expires_in - 60) * 1000,
-    });
+    setCookie(
+      res,
+      'session',
+      sign({
+        accessToken: data.access_token,
+        refreshToken: data.refresh_token,
+        expiresAt: Date.now() + (data.expires_in - 60) * 1000,
+      }),
+      60 * 60 * 24 * 30
+    );
 
     res.redirect('/');
   } catch (err) {
@@ -384,6 +439,12 @@ app.post('/api/create-playlist', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`BPM sorter running at http://127.0.0.1:${PORT}`);
-});
+// Only bind a port for local dev / a real Node host. On Netlify this file is required by
+// netlify/functions/server.js instead, which wraps `app` with serverless-http — no listen().
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`BPM sorter running at ${REDIRECT_URI.replace('/callback', '')}`);
+  });
+}
+
+module.exports = app;
