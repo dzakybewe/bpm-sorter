@@ -1,64 +1,92 @@
 require('dotenv').config();
+const crypto = require('crypto');
 const express = require('express');
 const fetch = require('node-fetch');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const REDIRECT_URI = `http://127.0.0.1:${PORT}/callback`;
 
-const {
-  SPOTIFY_CLIENT_ID,
-  SPOTIFY_CLIENT_SECRET,
-  GETSONGBPM_API_KEY,
-} = process.env;
+const { SPOTIFY_CLIENT_ID, GETSONGBPM_API_KEY } = process.env;
 
 app.use(express.static('public'));
 app.use(express.json());
 
-// ---------- Spotify: Client Credentials token (no user login needed) ----------
-let cachedToken = null;
-let tokenExpiresAt = 0;
+// ---------- tiny cookie-session helpers (single-user local tool) ----------
+const sessions = new Map(); // sid -> { accessToken, refreshToken, expiresAt }
+const pendingLogins = new Map(); // state -> { verifier, ts }
 
-async function getSpotifyToken() {
-  if (cachedToken && Date.now() < tokenExpiresAt) return cachedToken;
+function parseCookies(req) {
+  const header = req.headers.cookie || '';
+  return Object.fromEntries(
+    header.split(';').filter(Boolean).map((p) => {
+      const idx = p.indexOf('=');
+      return [p.slice(0, idx).trim(), decodeURIComponent(p.slice(idx + 1).trim())];
+    })
+  );
+}
 
-  if (!SPOTIFY_CLIENT_ID || !SPOTIFY_CLIENT_SECRET) {
-    throw new Error('Missing SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET in .env');
-  }
+function getOrCreateSid(req, res) {
+  const cookies = parseCookies(req);
+  if (cookies.sid && sessions.has(cookies.sid)) return cookies.sid;
 
+  const sid = crypto.randomBytes(24).toString('hex');
+  res.setHeader('Set-Cookie', `sid=${sid}; HttpOnly; SameSite=Lax; Path=/`);
+  return sid;
+}
+
+function base64url(buf) {
+  return buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+// ---------- Spotify: Authorization Code + PKCE (user login required for playlist items) ----------
+async function exchangeToken(params) {
   const res = await fetch('https://accounts.spotify.com/api/token', {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      Authorization:
-        'Basic ' +
-        Buffer.from(`${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}`).toString('base64'),
-    },
-    body: 'grant_type=client_credentials',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams(params).toString(),
   });
-
   if (!res.ok) {
     const body = await res.text();
     throw new Error(`Spotify token request failed (${res.status}): ${body}`);
   }
+  return res.json();
+}
 
-  const data = await res.json();
-  cachedToken = data.access_token;
-  tokenExpiresAt = Date.now() + (data.expires_in - 60) * 1000; // refresh 1min early
-  return cachedToken;
+async function getUserAccessToken(req, res) {
+  const cookies = parseCookies(req);
+  const session = sessions.get(cookies.sid);
+  if (!session) return null;
+
+  if (Date.now() < session.expiresAt) return session.accessToken;
+
+  if (!session.refreshToken) return null;
+
+  try {
+    const data = await exchangeToken({
+      grant_type: 'refresh_token',
+      refresh_token: session.refreshToken,
+      client_id: SPOTIFY_CLIENT_ID,
+    });
+    session.accessToken = data.access_token;
+    if (data.refresh_token) session.refreshToken = data.refresh_token; // Spotify may rotate it
+    session.expiresAt = Date.now() + (data.expires_in - 60) * 1000;
+    return session.accessToken;
+  } catch (e) {
+    sessions.delete(cookies.sid);
+    return null;
+  }
 }
 
 function extractPlaylistId(input) {
   if (!input) return null;
   const trimmed = input.trim();
 
-  // raw id (22 base62 chars, typical Spotify id length)
   if (/^[A-Za-z0-9]{15,30}$/.test(trimmed)) return trimmed;
 
-  // spotify:playlist:ID
   let m = trimmed.match(/spotify:playlist:([A-Za-z0-9]+)/);
   if (m) return m[1];
 
-  // https://open.spotify.com/playlist/ID?si=...
   m = trimmed.match(/open\.spotify\.com\/(?:intl-\w+\/)?playlist\/([A-Za-z0-9]+)/);
   if (m) return m[1];
 
@@ -74,6 +102,28 @@ async function spotifyGet(url, token) {
   return res.json();
 }
 
+async function spotifyPost(url, token, body) {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const errBody = await res.text();
+    throw new Error(`Spotify API error (${res.status}) on ${url}: ${errBody}`);
+  }
+  return res.json();
+}
+
+function chunk(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
 async function fetchPlaylist(playlistId, token) {
   const meta = await spotifyGet(
     `https://api.spotify.com/v1/playlists/${playlistId}?fields=name,owner(display_name),images,tracks.total`,
@@ -82,13 +132,13 @@ async function fetchPlaylist(playlistId, token) {
 
   const tracks = [];
   let url =
-    `https://api.spotify.com/v1/playlists/${playlistId}/tracks` +
-    `?limit=100&fields=next,items(track(id,name,duration_ms,external_urls,album(name),artists(name)))`;
+    `https://api.spotify.com/v1/playlists/${playlistId}/items` +
+    `?limit=100&fields=next,items(item(id,name,duration_ms,external_urls,album(name),artists(name)))`;
 
   while (url) {
     const page = await spotifyGet(url, token);
-    for (const item of page.items) {
-      const t = item.track;
+    for (const entry of page.items) {
+      const t = entry.item; // /items nests the track under "item", not "track" like the deprecated /tracks did
       if (!t) continue; // local/unavailable tracks can be null
       tracks.push({
         id: t.id,
@@ -116,6 +166,14 @@ function normalize(s) {
     .trim();
 }
 
+function cleanTitleForSearch(title) {
+  return (title || '')
+    .replace(/\(feat\.?[^)]*\)/gi, '')
+    .replace(/\(with[^)]*\)/gi, '')
+    .replace(/\s*-\s*.*(remix|edit|version|mix|remaster).*$/i, '')
+    .trim();
+}
+
 async function lookupBpm(title, artist) {
   const key = `${normalize(artist)}|||${normalize(title)}`;
   if (bpmCache.has(key)) return bpmCache.get(key);
@@ -124,8 +182,10 @@ async function lookupBpm(title, artist) {
     throw new Error('Missing GETSONGBPM_API_KEY in .env');
   }
 
-  const lookup = encodeURIComponent(`song:${title} artist:${artist}`);
-  const url = `https://api.getsong.co/search/?api_key=${GETSONGBPM_API_KEY}&type=both&lookup=${lookup}`;
+  // GetSongBPM's lookup param takes a bare title with type=song — the documented-looking
+  // "song:X artist:Y" combined syntax silently returns "no result" for real matches.
+  const lookup = encodeURIComponent(cleanTitleForSearch(title) || title);
+  const url = `https://api.getsong.co/search/?api_key=${GETSONGBPM_API_KEY}&type=song&lookup=${lookup}`;
 
   let result = null;
   try {
@@ -135,8 +195,12 @@ async function lookupBpm(title, artist) {
       const list = Array.isArray(data.search) ? data.search : [];
       if (list.length) {
         const normArtist = normalize(artist);
-        const best =
-          list.find((r) => normalize(r.artist && r.artist.name) === normArtist) || list[0];
+        // require a real artist match (exact, or one containing the other) — falling back to
+        // list[0] regardless of artist silently attaches the wrong song's BPM to the track
+        const best = list.find((r) => {
+          const ra = normalize(r.artist && r.artist.name);
+          return ra && (ra === normArtist || ra.includes(normArtist) || normArtist.includes(ra));
+        });
         if (best && best.tempo) {
           result = { bpm: Math.round(Number(best.tempo)), matched: best.title || title };
         }
@@ -168,9 +232,69 @@ async function mapWithConcurrency(items, limit, fn) {
 app.get('/api/health', (req, res) => {
   res.json({
     ok: true,
-    spotifyConfigured: Boolean(SPOTIFY_CLIENT_ID && SPOTIFY_CLIENT_SECRET),
+    spotifyConfigured: Boolean(SPOTIFY_CLIENT_ID),
     getsongbpmConfigured: Boolean(GETSONGBPM_API_KEY),
   });
+});
+
+app.get('/api/session', async (req, res) => {
+  const token = await getUserAccessToken(req, res);
+  res.json({ loggedIn: Boolean(token) });
+});
+
+app.get('/login', (req, res) => {
+  if (!SPOTIFY_CLIENT_ID) {
+    return res.status(500).send('Missing SPOTIFY_CLIENT_ID in .env');
+  }
+
+  const verifier = base64url(crypto.randomBytes(64));
+  const challenge = base64url(crypto.createHash('sha256').update(verifier).digest());
+  const state = crypto.randomBytes(16).toString('hex');
+  pendingLogins.set(state, { verifier, ts: Date.now() });
+
+  const params = new URLSearchParams({
+    client_id: SPOTIFY_CLIENT_ID,
+    response_type: 'code',
+    redirect_uri: REDIRECT_URI,
+    code_challenge_method: 'S256',
+    code_challenge: challenge,
+    state,
+    scope: 'playlist-modify-public playlist-modify-private',
+  });
+
+  res.redirect(`https://accounts.spotify.com/authorize?${params.toString()}`);
+});
+
+app.get('/callback', async (req, res) => {
+  const { code, state, error } = req.query;
+
+  if (error) return res.status(400).send(`Spotify login failed: ${error}`);
+
+  const pending = state && pendingLogins.get(state);
+  if (!pending) return res.status(400).send('Login expired or invalid state, try again.');
+  pendingLogins.delete(state);
+
+  try {
+    const data = await exchangeToken({
+      grant_type: 'authorization_code',
+      code,
+      redirect_uri: REDIRECT_URI,
+      client_id: SPOTIFY_CLIENT_ID,
+      code_verifier: pending.verifier,
+    });
+
+    const sid = getOrCreateSid(req, res);
+    sessions.set(sid, {
+      accessToken: data.access_token,
+      refreshToken: data.refresh_token,
+      expiresAt: Date.now() + (data.expires_in - 60) * 1000,
+    });
+
+    res.redirect('/');
+  } catch (err) {
+    console.error(err);
+    res.status(500).send(`Login failed: ${err.message}`);
+  }
 });
 
 app.get('/api/sort', async (req, res) => {
@@ -181,8 +305,12 @@ app.get('/api/sort', async (req, res) => {
     return res.status(400).json({ error: 'Could not parse a playlist ID from that link.' });
   }
 
+  const token = await getUserAccessToken(req, res);
+  if (!token) {
+    return res.status(401).json({ error: 'login_required' });
+  }
+
   try {
-    const token = await getSpotifyToken();
     const { name, owner, tracks } = await fetchPlaylist(playlistId, token);
 
     const withBpm = await mapWithConcurrency(tracks, 5, async (t) => {
@@ -215,6 +343,47 @@ app.get('/api/sort', async (req, res) => {
   }
 });
 
+app.post('/api/create-playlist', async (req, res) => {
+  const { name, uris } = req.body || {};
+
+  if (!name || !Array.isArray(uris) || uris.length === 0) {
+    return res.status(400).json({ error: 'Missing name or uris.' });
+  }
+
+  const token = await getUserAccessToken(req, res);
+  if (!token) {
+    return res.status(401).json({ error: 'login_required' });
+  }
+
+  try {
+    const playlist = await spotifyPost('https://api.spotify.com/v1/me/playlists', token, {
+      name,
+      public: true,
+      description: 'Sorted by BPM — created by BPM Sorter',
+    });
+
+    for (const batch of chunk(uris, 100)) {
+      await spotifyPost(`https://api.spotify.com/v1/playlists/${playlist.id}/items`, token, {
+        uris: batch,
+      });
+    }
+
+    res.json({
+      playlistUrl: playlist.external_urls ? playlist.external_urls.spotify : null,
+      name: playlist.name,
+    });
+  } catch (err) {
+    console.error(err);
+    const insufficientScope = /403/.test(err.message);
+    res.status(500).json({
+      error: insufficientScope
+        ? 'Missing playlist-write permission — reconnect Spotify to grant it.'
+        : err.message,
+      needsReauth: insufficientScope,
+    });
+  }
+});
+
 app.listen(PORT, () => {
-  console.log(`BPM sorter running at http://localhost:${PORT}`);
+  console.log(`BPM sorter running at http://127.0.0.1:${PORT}`);
 });

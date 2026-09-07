@@ -13,6 +13,11 @@
       <p class="subtitle">Paste a public playlist link. Get tracks sorted by tempo.</p>
     </header>
 
+    <div id="authBar" class="auth-bar">
+      <span id="authStatus">Checking Spotify login…</span>
+      <a id="loginLink" href="/login" class="login-btn" hidden>Connect Spotify</a>
+    </div>
+
     <form id="sortForm">
       <input
         id="playlistInput"
@@ -33,8 +38,12 @@
     <section id="results" hidden>
       <div class="results-head">
         <h2 id="playlistTitle"></h2>
-        <button id="exportBtn" type="button">Export CSV</button>
+        <div class="results-actions">
+          <button id="saveBtn" type="button">Save as Spotify playlist</button>
+          <button id="exportBtn" type="button">Export CSV</button>
+        </div>
       </div>
+      <p id="saveStatus" class="status" hidden></p>
       <table>
         <thead>
           <tr>

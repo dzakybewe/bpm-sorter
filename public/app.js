@@ -7,8 +7,32 @@ const results = document.getElementById('results');
 const playlistTitle = document.getElementById('playlistTitle');
 const resultsBody = document.getElementById('resultsBody');
 const exportBtn = document.getElementById('exportBtn');
+const saveBtn = document.getElementById('saveBtn');
+const saveStatus = document.getElementById('saveStatus');
 
 let lastData = null;
+
+const authStatus = document.getElementById('authStatus');
+const loginLink = document.getElementById('loginLink');
+
+async function checkSession() {
+  try {
+    const res = await fetch('/api/session');
+    const data = await res.json();
+    if (data.loggedIn) {
+      authStatus.textContent = 'Connected to Spotify.';
+      loginLink.hidden = true;
+      submitBtn.disabled = false;
+    } else {
+      authStatus.textContent = 'Not connected — login required to read playlist tracks.';
+      loginLink.hidden = false;
+      submitBtn.disabled = true;
+    }
+  } catch {
+    authStatus.textContent = 'Could not reach server.';
+  }
+}
+checkSession();
 
 function setStatus(msg, isError = false) {
   statusEl.hidden = !msg;
@@ -65,6 +89,10 @@ form.addEventListener('submit', async (e) => {
   try {
     const res = await fetch(`/api/sort?playlist=${encodeURIComponent(playlist)}&order=${order}`);
     const data = await res.json();
+    if (res.status === 401) {
+      window.location.href = '/login';
+      return;
+    }
     if (!res.ok) throw new Error(data.error || 'Request failed');
 
     setStatus(
@@ -77,6 +105,42 @@ form.addEventListener('submit', async (e) => {
     setStatus(err.message, true);
   } finally {
     submitBtn.disabled = false;
+  }
+});
+
+saveBtn.addEventListener('click', async () => {
+  if (!lastData) return;
+  const uris = lastData.tracks.filter((t) => t.id).map((t) => `spotify:track:${t.id}`);
+  if (!uris.length) return;
+
+  saveBtn.disabled = true;
+  saveStatus.hidden = false;
+  saveStatus.className = 'status';
+  saveStatus.textContent = 'Creating playlist on Spotify…';
+
+  try {
+    const res = await fetch('/api/create-playlist', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: `${lastData.playlistName} (by BPM)`,
+        uris,
+      }),
+    });
+    const data = await res.json();
+
+    if (res.status === 401 || data.needsReauth) {
+      window.location.href = '/login';
+      return;
+    }
+    if (!res.ok) throw new Error(data.error || 'Request failed');
+
+    saveStatus.innerHTML = `Created — <a href="${data.playlistUrl}" target="_blank" rel="noopener">open "${data.name}" on Spotify</a>`;
+  } catch (err) {
+    saveStatus.className = 'status error';
+    saveStatus.textContent = err.message;
+  } finally {
+    saveBtn.disabled = false;
   }
 });
 
